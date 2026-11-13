@@ -237,6 +237,36 @@ def test_attachments():
         assert expected_sql[i] == attachment.to_sql()
 
 
+def test_attachment_strips_query_parameters_from_motherduck_paths():
+    assert (
+        Attachment(path="md:my_db?motherduck_token=abc123&user=1").to_sql()
+        == "ATTACH IF NOT EXISTS 'md:my_db'"
+    )
+    assert (
+        Attachment(path="motherduck:my_db?motherduck_token=abc123").to_sql()
+        == "ATTACH IF NOT EXISTS 'motherduck:my_db'"
+    )
+    assert (
+        Attachment(path="md:my_db?motherduck_token=ab#cd").to_sql()
+        == "ATTACH IF NOT EXISTS 'md:my_db'"
+    )
+    assert Attachment(path="md:my_db").to_sql() == "ATTACH IF NOT EXISTS 'md:my_db'"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "postgresql://user@hostname/dbname?sslmode=require",
+        "https://example.com/db.duckdb?token=abc123",
+        "dbname=db host=h user=u password=aa?bb sslmode=require",
+        "dbname=db host=h user=u password=a#b?c sslmode=require",
+        "ducklake:postgres:dbname=meta host=h password=x?y",
+    ],
+)
+def test_attachment_preserves_query_parameters_for_non_motherduck_paths(path):
+    assert Attachment(path=path).to_sql() == f"ATTACH IF NOT EXISTS '{path}'"
+
+
 def test_attachments_with_options():
     # Test arbitrary options in options dict
     attachment = Attachment(
@@ -317,6 +347,22 @@ def test_infer_database_name_from_path():
     creds = DuckDBCredentials.from_dict(payload)
     assert creds.database == "f1234"
 
+    payload = {"path": "/tmp/analytics.duckdb"}
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == "analytics"
+
+    payload = {"path": "/tmp/analytics.v2.duckdb"}
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == "analytics"
+
+    payload = {"path": "my.db.duckdb"}
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == "my"
+
+    payload = {"path": ".hidden.duckdb"}
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == "hidden"
+
     payload = {"path": "md:?token=abc123"}
     creds = DuckDBCredentials.from_dict(payload)
     assert creds.database == "my_db"
@@ -335,6 +381,22 @@ def test_infer_database_name_from_path():
     }
     creds = DuckDBCredentials.from_dict(payload)
     assert creds.database == "remote"
+
+
+@pytest.mark.parametrize(
+    "filename", ["analytics.duckdb", "analytics.v2.duckdb", "my.db.duckdb", ".hidden.duckdb"]
+)
+def test_path_derived_database_name_matches_duckdb(tmp_path, filename):
+    path = str(tmp_path / filename)
+    with duckdb.connect(path) as conn:
+        catalog = conn.execute("SELECT current_database()").fetchone()[0]
+    assert DuckDBCredentials.path_derived_database_name(path) == catalog
+
+
+def test_database_matches_dotted_path():
+    payload = {"path": "/tmp/analytics.v2.duckdb", "database": "analytics"}
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == "analytics"
 
 
 def test_database_matches_attach_alias():
@@ -383,6 +445,104 @@ def test_database_matches_attach_alias_no_alias():
     assert "Inconsistency detected between 'path' and 'database' fields" in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "attachment, database",
+    [
+        ({"path": "/tmp/secondary.db"}, "secondary"),
+        ({"path": "/tmp/other.duckdb"}, "other"),
+        ({"path": "/tmp/other.duckdb", "type": "duckdb"}, "other"),
+        ({"path": "/tmp/other.duckdb", "options": {"type": "duckdb"}}, "other"),
+        ({"path": "s3://bucket/even/this/works.duckdb"}, "works"),
+        ({"path": "md:my_db"}, "my_db"),
+        ({"path": "ducklake:/tmp/lake.ducklake"}, "lake"),
+        ({"path": "ducklake:/tmp/lake.ducklake", "type": "ducklake"}, "lake"),
+        ({"path": "ducklake:sqlite:/tmp/lake.sqlite", "type": "DuckLake"}, "lake"),
+    ],
+)
+def test_database_matches_unaliased_attachment_name(attachment, database):
+    """A DuckDB-backed attachment without an alias is registered under the name DuckDB
+    derives from its path, so the database field may name it the same way."""
+    payload = {
+        "path": "/tmp/primary.db",
+        "database": database,
+        "attach": [attachment],
+    }
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == database
+
+
+@pytest.mark.parametrize(
+    "attachment, database",
+    [
+        ({"path": "postgresql://user@localhost:5432/secondary", "type": "postgres"}, "secondary"),
+        ({"path": "dbname=secondary host=localhost", "type": "postgres"}, "secondary"),
+        (
+            {"path": "dbname=secondary host=localhost", "type": "postgres"},
+            "dbname=secondary host=localhost",
+        ),
+        ({"path": "postgresql://user@localhost:5432/secondary", "options": {"type": "postgres"}}, "secondary"),
+        ({"path": "/tmp/secondary.sqlite", "type": "sqlite"}, "secondary"),
+    ],
+)
+def test_database_does_not_match_unaliased_non_duckdb_attachment(attachment, database):
+    """For attachments that are not DuckDB-backed the path is a DSN or a foreign file and the
+    name DuckDB registers is not reliably path-derived, so the path-derived name is not accepted
+    and the attachment has to be aliased to be used as the target database."""
+    from dbt_common.exceptions import DbtRuntimeError
+
+    payload = {
+        "path": "/tmp/primary.db",
+        "database": database,
+        "attach": [attachment],
+    }
+    with pytest.raises(DbtRuntimeError) as exc:
+        DuckDBCredentials.from_dict(payload)
+    assert "Inconsistency detected between 'path' and 'database' fields" in str(exc.value)
+
+
+def test_database_matches_aliased_non_duckdb_attachment():
+    """An alias is honoured regardless of the attachment type."""
+    payload = {
+        "path": "/tmp/primary.db",
+        "database": "pg",
+        "attach": [{"path": "dbname=secondary host=localhost", "type": "postgres", "alias": "pg"}],
+    }
+    creds = DuckDBCredentials.from_dict(payload)
+    assert creds.database == "pg"
+
+
+def test_database_does_not_match_aliased_attachment_by_path_name():
+    """Once an attachment has an alias, DuckDB no longer registers it under its path-derived
+    name, so the database field cannot refer to it that way."""
+    from dbt_common.exceptions import DbtRuntimeError
+
+    payload = {
+        "path": "/tmp/primary.db",
+        "database": "secondary",
+        "attach": [{"path": "/tmp/secondary.db", "alias": "my_alias"}],
+    }
+    with pytest.raises(DbtRuntimeError) as exc:
+        DuckDBCredentials.from_dict(payload)
+    assert "Inconsistency detected between 'path' and 'database' fields" in str(exc.value)
+
+
+def test_ducklake_dbs_from_attachment_type():
+    """Attachments declared with type: ducklake are tracked as DuckLake databases."""
+    creds = DuckDBCredentials.from_dict(
+        {
+            "path": ":memory:",
+            "attach": [
+                {"path": "/tmp/meta.ducklake", "alias": "typed_lake", "type": "ducklake"},
+                {"path": "/tmp/lake.ducklake", "options": {"type": "DUCKLAKE"}},
+                {"path": "ducklake:/tmp/prefixed.ducklake", "alias": "prefixed_lake"},
+                {"path": "/tmp/other.db", "alias": "other", "type": "sqlite"},
+            ],
+        }
+    )
+
+    assert creds._ducklake_dbs == {"typed_lake", "lake", "prefixed_lake"}
+
+
 def test_add_ducklake_secret_with_map():
     """Test ducklake secret with metadata_parameters as a map."""
     creds = DuckDBCredentials(
@@ -425,3 +585,82 @@ def test_add_secret_with_list():
     allowed_hosts array ['host1', 'host2', 'host3']
 )"""
     assert sql == expected
+
+
+def test_motherduck_token_top_level():
+    creds = DuckDBCredentials(path="md:my_db", motherduck_token="quack")
+    assert creds.settings["motherduck_token"] == "quack"
+    # the auto-added motherduck plugin moves the token from the settings
+    # into the duckdb.connect config for non-attach connections
+    assert "motherduck" in [p.module for p in creds.plugins]
+    from dbt.adapters.duckdb.plugins import BasePlugin
+
+    plugin = BasePlugin.create("motherduck", credentials=creds)
+    config = {}
+    plugin.update_connection_config(creds, config)
+    assert config["motherduck_token"] == "quack"
+    assert "motherduck_token" not in creds.settings
+
+
+def test_motherduck_token_top_level_matching_settings():
+    creds = DuckDBCredentials(
+        path="md:my_db",
+        motherduck_token="quack",
+        settings={"motherduck_token": "quack"},
+    )
+    assert creds.settings["motherduck_token"] == "quack"
+
+
+def test_motherduck_token_conflict():
+    from dbt_common.exceptions import DbtRuntimeError
+
+    with pytest.raises(DbtRuntimeError):
+        DuckDBCredentials(
+            path="md:my_db",
+            motherduck_token="quack",
+            settings={"motherduck_token": "honk"},
+        )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["motherduck_token", "MOTHERDUCK_TOKEN", "token", "TOKEN"],
+)
+def test_motherduck_token_settings_aliases_removed_for_direct_connection(key):
+    from dbt.adapters.duckdb.environments import Environment
+
+    creds = DuckDBCredentials(path="md:my_db", settings={key: "quack", "threads": 2})
+    plugins = Environment.initialize_plugins(creds)
+    config = {}
+    for plugin in plugins.values():
+        plugin.update_connection_config(creds, config)
+    assert config["motherduck_token"] == "quack"
+    # init-only options must not be re-applied with SET statements on cursors
+    assert creds.settings == {"threads": 2}
+    cursor = mock.MagicMock()
+    Environment.initialize_cursor(creds, cursor)
+    assert [c.args[0] for c in cursor.execute.call_args_list] == ["SET threads = '2'"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["motherduck_token", "MOTHERDUCK_TOKEN", "token", "TOKEN"],
+)
+def test_motherduck_token_settings_aliases_removed_for_attachment(key):
+    from dbt.adapters.duckdb.environments import Environment
+
+    creds = DuckDBCredentials(
+        path=":memory:",
+        attach=[Attachment(path="md:my_db")],
+        settings={key: "quack", "threads": 2},
+    )
+    plugins = Environment.initialize_plugins(creds)
+    conn = mock.MagicMock()
+    for plugin in plugins.values():
+        plugin.configure_connection(conn)
+    assert [c.args[0] for c in conn.execute.call_args_list] == ["SET motherduck_token = 'quack'"]
+    # init-only options must not be re-applied with SET statements on cursors
+    assert creds.settings == {"threads": 2}
+    cursor = mock.MagicMock()
+    Environment.initialize_cursor(creds, cursor)
+    assert [c.args[0] for c in cursor.execute.call_args_list] == ["SET threads = '2'"]

@@ -1,5 +1,5 @@
 import os
-import traceback
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,10 +13,11 @@ from uuid import uuid4
 
 from dbt_common.contracts.constraints import ColumnLevelConstraint
 from dbt_common.contracts.constraints import ConstraintType
+from dbt_common.contracts.constraints import ModelLevelConstraint
 from dbt_common.dataclass_schema import dbtClassMixin
 from dbt_common.dataclass_schema import ValidationError
+from dbt_common.exceptions import CompilationError
 from dbt_common.exceptions import DbtDatabaseError
-from dbt_common.exceptions import DbtInternalError
 from dbt_common.exceptions import DbtRuntimeError
 from dbt_common.utils import encoding as dbt_encoding
 from packaging.version import Version
@@ -24,6 +25,9 @@ from packaging.version import Version
 from .constants import DEFAULT_TEMP_SCHEMA_NAME
 from .constants import DUCKDB_BASE_INCREMENTAL_STRATEGIES
 from .constants import DUCKDB_MERGE_LOWEST_VERSION_POSSIBLE
+from .constants import DUCKLAKE_ALTER_RENAME_FIX_VERSION
+from .constants import FLIGHT_NAME_KEY
+from .constants import FLIGHT_SUBMISSION
 from .constants import TEMP_SCHEMA_NAME
 from dbt.adapters.base import AdapterConfig
 from dbt.adapters.base import BaseRelation
@@ -40,6 +44,7 @@ from dbt.adapters.contracts.relation import RelationType
 from dbt.adapters.duckdb.column import DuckDBColumn
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.relation import DuckDBRelation
+from dbt.adapters.duckdb.utils import escape_sql_string
 from dbt.adapters.duckdb.utils import TargetConfig
 from dbt.adapters.duckdb.utils import TargetLocation
 from dbt.adapters.events.logging import AdapterLogger
@@ -96,10 +101,19 @@ class DuckDBAdapter(SQLAdapter):
     Column = DuckDBColumn
     Relation = DuckDBRelation
 
+    def __init__(self, config: Any, mp_context: Any) -> None:
+        super().__init__(config, mp_context)
+        self._key_constraints_by_schema: dict[tuple[str, str], dict[str, set[ConstraintType]]] = {}
+        self._catalog_types: Optional[dict[str, str]] = None
+        self._key_constraint_cache_lock = threading.RLock()
+
     AdapterSpecificConfigs = DuckDBConfig
 
     _capabilities: CapabilityDict = CapabilityDict(
-        {Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full)}
+        {
+            Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full),
+            Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.Full),
+        }
     )
 
     CONSTRAINT_SUPPORT = {
@@ -109,12 +123,6 @@ class DuckDBAdapter(SQLAdapter):
         ConstraintType.primary_key: ConstraintSupport.ENFORCED,
         ConstraintType.foreign_key: ConstraintSupport.ENFORCED,
     }
-
-    _capabilities = CapabilityDict(
-        {
-            Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.Full),
-        }
-    )
 
     # can be overridden via the model config metadata
     _temp_schema_name = DEFAULT_TEMP_SCHEMA_NAME
@@ -162,12 +170,42 @@ class DuckDBAdapter(SQLAdapter):
         return self.config.credentials.disable_transactions
 
     @available
+    def escape_sql_string(self, value: Any) -> str:
+        return escape_sql_string(value)
+
+    @available
+    def ensure_transaction(self) -> None:
+        """Open a transaction on this thread's connection if one is not already open.
+
+        Replacing a table in place (drop, then create under the same name) is only
+        safe inside a transaction: if the build fails, the rollback restores the old
+        table. This opens one even when disable_transactions is set, with a warning; the
+        materialization's adapter.commit() closes it, and dbt rolls it back if the model fails.
+        """
+        connection = self.connections.get_thread_connection()
+        if not connection.transaction_open:
+            if self.disable_transactions():
+                DuckDBConnectionManager.warn_once(
+                    "disable_transactions is set, but dbt-duckdb uses a transaction to rebuild "
+                    "tables with foreign key constraints in place, so a failed build does not "
+                    "lose the existing table's data."
+                )
+            self.connections.begin()
+
+    @available
     def is_ducklake(self, relation: DuckDBRelation) -> bool:
         """Check if a relation's database is backed by a ducklake attachment."""
         if not relation or not relation.database:
             return False
 
         return relation.database in self.config.credentials._ducklake_dbs
+
+    @available
+    def use_ducklake_table_workarounds(self, relation: DuckDBRelation) -> bool:
+        """Return whether pre-1.5.3 DuckLake table workarounds are required."""
+        return self.is_ducklake(relation) and self.duckdb_version < Version(
+            DUCKLAKE_ALTER_RENAME_FIX_VERSION
+        )
 
     @available
     def convert_datetimes_to_strs(self, table: "agate.Table") -> "agate.Table":
@@ -228,12 +266,44 @@ class DuckDBAdapter(SQLAdapter):
     def get_binding_char(self):
         return DuckDBConnectionManager.env().get_binding_char()
 
+    # The extension DuckDB appends to each CSV or JSON file it writes with this
+    # compression; Parquet files compress internally and keep their extension
+    _compression_extensions = {"gzip": ".gz", "zstd": ".zst"}
+    _extension_compressions = {ext: name for name, ext in _compression_extensions.items()}
+
     @available
     def external_write_options(self, write_location: str, rendered_options: dict) -> str:
+        # DuckDB's COPY options are case-insensitive, so normalize the keys in place
+        # for the checks below and for the callers that read the options afterwards
+        normalized: dict[str, Any] = {}
+        original_keys: dict[str, str] = {}
+        for k, v in rendered_options.items():
+            key = k.lower()
+            if key in normalized:
+                # e.g. options={'FORMAT': 'parquet'} with the top-level format='csv'
+                raise CompilationError(
+                    f"The write options '{original_keys[key]}' and '{k}' set the same "
+                    "DuckDB option, which is case-insensitive; set it only once"
+                )
+            normalized[key] = v
+            original_keys[key] = k
+        rendered_options.clear()
+        rendered_options.update(normalized)
+
         if "format" not in rendered_options:
-            ext = os.path.splitext(write_location)[1].lower()
+            root, ext = os.path.splitext(write_location)
+            # DuckDB infers the compression from a trailing .gz/.zst, so the
+            # format comes from the extension before it (e.g. "data.csv.gz")
+            compression = self._extension_compressions.get(ext.lower())
+            if compression:
+                ext = os.path.splitext(root)[1]
+            ext = ext.lower()
             if ext:
                 rendered_options["format"] = ext[1:]
+                # DuckDB's own inference is case-sensitive, so "data.CSV.GZ"
+                # would otherwise be written uncompressed
+                if compression and "compression" not in rendered_options:
+                    rendered_options["compression"] = compression
             elif "delimiter" in rendered_options:
                 rendered_options["format"] = "csv"
             else:
@@ -250,7 +320,7 @@ class DuckDBAdapter(SQLAdapter):
 
         ret = []
         for k, v in rendered_options.items():
-            if k.lower() in {
+            if k in {
                 "delimiter",
                 "quote",
                 "escape",
@@ -263,13 +333,26 @@ class DuckDBAdapter(SQLAdapter):
 
     @available
     def external_read_location(self, write_location: str, rendered_options: dict) -> str:
+        rendered_options = {k.lower(): v for k, v in rendered_options.items()}
         if rendered_options.get("partition_by") or rendered_options.get("per_thread_output"):
             globs = [write_location, "*"]
             if rendered_options.get("partition_by"):
                 partition_by = str(rendered_options.get("partition_by"))
                 globs.extend(["*"] * len(partition_by.split(",")))
-            return ".".join(["/".join(globs), str(rendered_options.get("format", "parquet"))])
+            return "/".join(globs) + self._external_file_extension(rendered_options)
         return write_location
+
+    @classmethod
+    def _external_file_extension(cls, rendered_options: dict) -> str:
+        """The extension of the files a partitioned or per-thread COPY writes."""
+        file_format = str(rendered_options.get("format", "parquet")).lower()
+        extension = str(rendered_options.get("file_extension") or file_format).lstrip(".")
+        if file_format in {"csv", "json"}:
+            compression = str(rendered_options.get("compression", "")).strip("'\"").lower()
+            suffix = cls._compression_extensions.get(compression, "")
+            if suffix and not extension.endswith(suffix):
+                extension += suffix
+        return "." + extension
 
     @available
     def warn_once(self, msg: str):
@@ -280,8 +363,10 @@ class DuckDBAdapter(SQLAdapter):
     def duckdb_version(self) -> Version:
         """Get the DuckDB version for the current DuckDB connection (cached)."""
         _, cursor = self.connections.add_select_query("SELECT version()")
-        row = cursor.fetchone()
-        version_string = row[0] if row else None
+        # fetchall() drains the result; DuckDB 2.0 rejects register() on a cursor
+        # whose result was only partially fetched.
+        rows = cursor.fetchall()
+        version_string = rows[0][0] if rows else None
 
         if not version_string:
             raise DbtDatabaseError(
@@ -317,21 +402,40 @@ class DuckDBAdapter(SQLAdapter):
         return super().get_incremental_strategy_macro(model_context, strategy)
 
     def commit_if_has_connection(self) -> None:
-        """This is just a quick-fix. Python models do not execute begin function so the transaction_open is always false."""
-        try:
-            self.connections.commit_if_has_connection()
-        except DbtInternalError as e:
-            # Log commit errors instead of silently swallowing them to aid debugging
-            logger.warning(f"Commit failed with DbtInternalError: {e}\n{traceback.format_exc()}")
-            # Still pass to maintain backward compatibility, but now with visibility
-            pass
+        """Commit the current transaction only if the connection has one open.
+
+        The connection can legitimately have no open transaction here: Python
+        models never issue BEGIN, and DuckDB autocommits statements against
+        some attached catalogs (e.g. DuckLake), closing the transaction before
+        dbt gets to commit it. Calling commit() in that state raises
+        DbtInternalError, which used to be caught and logged with a full
+        traceback on every affected node. Check the transaction state up front
+        instead, so a normal condition does not produce warning-level noise.
+        """
+        connection = self.connections.get_if_exists()
+        if connection is not None and not connection.transaction_open:
+            logger.debug(f'Skipping commit on connection "{connection.name}": no transaction open')
+            return
+        self.connections.commit_if_has_connection()
 
     def submit_python_job(self, parsed_model: dict, compiled_code: str) -> AdapterResponse:
         connection = self.connections.get_if_exists()
         if not connection:
             connection = self.connections.get_thread_connection()
         env = DuckDBConnectionManager.env()
+        parsed_model = self._resolve_flight_name(env, parsed_model)
         return env.submit_python_job(connection.handle, parsed_model, compiled_code)
+
+    def _resolve_flight_name(self, env, parsed_model: dict) -> dict:
+        """Name the MotherDuck Flight for a model, via the overridable macro.
+        Macros are only resolvable here, on the adapter, so the name rides along
+        in the model dict rather than through the Environment interface.
+        """
+        submission_method = getattr(env, "submission_method", None)
+        if submission_method is None or submission_method(parsed_model) != FLIGHT_SUBMISSION:
+            return parsed_model
+        name = self.execute_macro("flight_name", kwargs={"parsed_model": parsed_model})
+        return {**parsed_model, FLIGHT_NAME_KEY: name}
 
     def get_rows_different_sql(
         self,
@@ -386,18 +490,37 @@ class DuckDBAdapter(SQLAdapter):
         rendering."""
         if constraint.type == ConstraintType.foreign_key:
             if constraint.to and constraint.to_columns:
-                # TODO: this is a hack to get around a limitation in DuckDB around setting FKs
-                # across databases.
-                pieces = constraint.to.split(".")
-                if len(pieces) > 2:
-                    constraint_to = ".".join(pieces[1:])
-                else:
-                    constraint_to = constraint.to
+                constraint_to = cls._constraint_target_without_database(constraint.to)
                 return f"references {constraint_to} ({', '.join(constraint.to_columns)})"
             else:
                 return f"references {constraint.expression}"
         else:
             return super().render_column_constraint(constraint)
+
+    @classmethod
+    def render_model_constraint(cls, constraint: ModelLevelConstraint) -> Optional[str]:
+        if (
+            constraint.type == ConstraintType.foreign_key
+            and constraint.to
+            and constraint.to_columns
+        ):
+            constraint_prefix = f"constraint {constraint.name} " if constraint.name else ""
+            column_list = ", ".join(constraint.columns)
+            constraint_to = cls._constraint_target_without_database(constraint.to)
+            return (
+                f"{constraint_prefix}foreign key ({column_list}) references "
+                f"{constraint_to} ({', '.join(constraint.to_columns)})"
+            )
+        return super().render_model_constraint(constraint)
+
+    @staticmethod
+    def _constraint_target_without_database(constraint_to: str) -> str:
+        # DuckDB does not accept a catalog-qualified foreign key target, even when
+        # the target is in the current catalog.
+        pieces = constraint_to.split(".")
+        if len(pieces) > 2:
+            return ".".join(pieces[1:])
+        return constraint_to
 
     def _clean_up_temp_relation_for_incremental(self, config):
         if self.is_motherduck() and hasattr(config, "model"):
@@ -412,17 +535,154 @@ class DuckDBAdapter(SQLAdapter):
                 )
                 self.drop_relation(temp_relation)
 
-    def pre_model_hook(self, config: Any) -> None:
+    # Creating or dropping a table with a foreign key also alters the table it
+    # references, so DuckDB raises a write-write conflict when two models that share
+    # a foreign key relationship are built in concurrent transactions. Models that
+    # declare a foreign key, or that a foreign key currently references, take this
+    # lock for the whole materialization.
+    _foreign_key_lock = threading.Lock()
+    _foreign_key_catalog_types = {"duckdb", "motherduck"}
+
+    @staticmethod
+    def _key_constraint_types(model: Any) -> set:
+        contract = getattr(model, "contract", None)
+        if not (contract and contract.enforced):
+            return set()
+        constraints = list(getattr(model, "constraints", None) or [])
+        for column in (getattr(model, "columns", None) or {}).values():
+            constraints.extend(column.constraints or [])
+        key_types = {ConstraintType.primary_key, ConstraintType.unique, ConstraintType.foreign_key}
+        return {constraint.type for constraint in constraints} & key_types
+
+    @staticmethod
+    def _relation_components(relation: Any) -> tuple[str, str, str]:
+        database = getattr(relation, "database", None)
+        schema = getattr(relation, "schema", None)
+        identifier = (
+            getattr(relation, "identifier", None)
+            or getattr(relation, "alias", None)
+            or getattr(relation, "name", None)
+        )
+        if not database or not schema or not identifier:
+            raise DbtRuntimeError(
+                "Foreign key metadata requires a relation with a database, schema, "
+                f"and identifier; got {relation}"
+            )
+        return str(database), str(schema), str(identifier)
+
+    def _catalog_type(self, database: str) -> Optional[str]:
+        if self.config.credentials.remote:
+            # Buena Vista does not expose DuckDB catalog metadata through its cursor.
+            return "remote"
+        with self._key_constraint_cache_lock:
+            if self._catalog_types is None:
+                _, table = self.execute(
+                    "select database_name, type from duckdb_databases()",
+                    fetch=True,
+                )
+                self._catalog_types = {
+                    str(row[0]).casefold(): str(row[1]).casefold() for row in table
+                }
+            return self._catalog_types.get(database.casefold())
+
+    def _catalog_supports_foreign_keys(self, database: str) -> bool:
+        return self._catalog_type(database) in self._foreign_key_catalog_types
+
+    @available
+    def catalog_supports_foreign_keys(self, database: str) -> bool:
+        return self._catalog_supports_foreign_keys(database)
+
+    def _is_foreign_key_target(self, model: Any) -> bool:
+        # Foreign keys cannot cross schemas in DuckDB, so only this schema can hold one
+        database, schema, identifier = self._relation_components(model)
+        _, table = self.execute(
+            f"""
+            select 1 from duckdb_constraints()
+            where constraint_type = 'FOREIGN KEY'
+              and lower(database_name) = lower('{escape_sql_string(database)}')
+              and lower(schema_name) = lower('{escape_sql_string(schema)}')
+              and lower(referenced_table) = lower('{escape_sql_string(identifier)}')
+              and lower(table_name) <> lower(referenced_table)
+            limit 1
+            """,
+            fetch=True,
+        )
+        return len(table) > 0
+
+    def _existing_key_constraint_types(self, relation: Any) -> set:
+        by_name = {
+            "PRIMARY KEY": ConstraintType.primary_key,
+            "UNIQUE": ConstraintType.unique,
+            "FOREIGN KEY": ConstraintType.foreign_key,
+        }
+        database, schema, identifier = self._relation_components(relation)
+        if not self._catalog_supports_foreign_keys(database):
+            return set()
+        schema_key = (database.casefold(), schema.casefold())
+        with self._key_constraint_cache_lock:
+            if schema_key not in self._key_constraints_by_schema:
+                # Snapshot the schema before its first model runs. Constraints added
+                # during this run are already present in each model's current config.
+                _, table = self.execute(
+                    f"""
+                    select table_name, constraint_type from duckdb_constraints()
+                    where lower(database_name) = lower('{escape_sql_string(database)}')
+                      and lower(schema_name) = lower('{escape_sql_string(schema)}')
+                      and constraint_type in ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY')
+                    """,
+                    fetch=True,
+                )
+                constraints_by_table: dict[str, set[ConstraintType]] = defaultdict(set)
+                for row in table:
+                    constraints_by_table[str(row[0]).casefold()].add(by_name[row[1]])
+                self._key_constraints_by_schema[schema_key] = constraints_by_table
+            return set(
+                self._key_constraints_by_schema[schema_key].get(identifier.casefold(), set())
+            )
+
+    @available
+    def existing_key_constraint_types(self, relation: Any) -> list[str]:
+        return sorted(item.value for item in self._existing_key_constraint_types(relation))
+
+    def _acquire_foreign_key_lock(self, model: Any) -> bool:
+        """Take the foreign key lock if this model needs it, returning whether it does."""
+        database, _, _ = self._relation_components(model)
+        if not self._catalog_supports_foreign_keys(database):
+            # Other catalogs keep their constraints as declared, without our handling
+            return False
+        types = self._key_constraint_types(model)
+        if not types:
+            types = self._existing_key_constraint_types(model)
+            if not types:
+                return False
+        self._foreign_key_lock.acquire()
+        # Check for references only while holding the lock: a foreign key model being
+        # built in another thread can hide its references from duckdb_constraints()
+        # until it commits.
+        try:
+            types |= self._existing_key_constraint_types(model)
+            if ConstraintType.foreign_key in types or self._is_foreign_key_target(model):
+                return True
+        except BaseException:
+            self._foreign_key_lock.release()
+            raise
+        self._foreign_key_lock.release()
+        return False
+
+    def pre_model_hook(self, config: Any) -> Any:
         """A hook for getting the temp schema name from the model config.
         Cleans up the remote temporary table on MotherDuck before running
-        an incremental model.
+        an incremental model, and serializes models in foreign key relationships.
         """
+        holds_foreign_key_lock = False
         if hasattr(config, "model"):
             self._temp_schema_name = config.model.config.meta.get(
                 TEMP_SCHEMA_NAME, self._temp_schema_name
             )
             self._clean_up_temp_relation_for_incremental(config)
+            holds_foreign_key_lock = self._acquire_foreign_key_lock(config.model)
         super().pre_model_hook(config)
+        return holds_foreign_key_lock
 
     @available
     def batch_id_for_model(self, model: Any) -> str:
@@ -474,8 +734,12 @@ class DuckDBAdapter(SQLAdapter):
         """A hook for cleaning up the remote temporary table on MotherDuck if the
         incremental model materialization fails to do so.
         """
-        self._clean_up_temp_relation_for_incremental(config)
-        super().post_model_hook(config, context)
+        try:
+            self._clean_up_temp_relation_for_incremental(config)
+            super().post_model_hook(config, context)
+        finally:
+            if context is True:
+                self._foreign_key_lock.release()
 
 
 # Change `table_a/b` to `table_aaaaa/bbbbb` to avoid duckdb binding issues when relation_a/b

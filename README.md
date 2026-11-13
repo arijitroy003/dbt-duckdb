@@ -14,20 +14,20 @@ This project is hosted on PyPI, so you should be able to install it and the nece
 
 `pip3 install dbt-duckdb`
 
-The latest supported version targets `dbt-core` versions >= 1.8.x and `duckdb` version 1.1.x, but we work hard to ensure that newer
+The latest supported version targets `dbt-core` versions >= 1.8.x and `duckdb` version >= 1.1.0, but we work hard to ensure that newer
 versions of DuckDB will continue to work with the adapter as they are released.
 
 ### Configuring Your Profile
 
 A super-minimal dbt-duckdb profile only needs *one* setting:
 
-````
+```yml
 default:
   outputs:
     dev:
       type: duckdb
   target: dev
-````
+```
 
 This will run your dbt-duckdb pipeline against an in-memory DuckDB database that will not be persisted after your run completes. This may
 not seem very useful at first, but it turns out to be a powerful tool for a) testing out data pipelines, either locally or in CI jobs and
@@ -37,31 +37,70 @@ in dbt-duckdb are provided in the docs on [reading and writing external files](#
 To have your dbt pipeline persist relations in a DuckDB file, set the `path` field in your profile to the path
 of the DuckDB file that you would like to read and write on your local filesystem. (For in-memory pipelines, the `path`
 is automatically set to the special value `:memory:`). By default, the `path` is relative to your `profiles.yml` file location.
-If the database doesn't exist at the specified `path`, DuckDB will automatically create it.
+If the database doesn't exist at the specified `path`, DuckDB will automatically create it. E.g.:
+
+```yml
+default:
+  outputs:
+    dev:
+      type: duckdb
+       path: "dbt.duckdb"                   # local database
+       # path: "ducklake:my_lake.ducklake"  # local DuckLake
+  target: dev
+```
 
 `dbt-duckdb` also supports common profile fields like `schema` and `threads`, but the `database` property is special: its value is automatically set
 to the basename of the file in the `path` argument with the suffix removed. For example, if the `path` is `/tmp/a/dbfile.duckdb`, the `database`
 field will be set to `dbfile`. If you are running in in-memory mode, then the `database` property will be automatically set to `memory`.
+
+#### Persisting dbt Docs as Comments
+
+dbt model and column descriptions are not persisted to the database by default. If your project documents models in schema YAML files, enable
+`persist_docs` so dbt-duckdb writes those descriptions as DuckDB relation and column comments:
+
+```
+models:
+  +persist_docs:
+    relation: true
+    columns: true
+```
+
+Persisted comments are useful context for anyone exploring the database. They also help AI agents and other automated tools understand table
+purpose, column meaning, and expected grain before they generate queries.
 
 #### Using MotherDuck
 
 As of `dbt-duckdb` 1.5.2, you can connect to a DuckDB instance running on [MotherDuck](http://www.motherduck.com) by setting your `path` to use a [md:<database> connection string](https://motherduck.com/docs/getting-started/connect-query-from-python/installation-authentication), just as you would with the DuckDB CLI
 or the Python API.
 
-MotherDuck databases generally work the same way as local DuckDB databases from the perspective of dbt, but
-there are a [few differences to be aware of](https://motherduck.com/docs/architecture-and-capabilities#considerations-and-limitations):
-1. MotherDuck is compatible with client DuckDB versions 0.10.2 and older.
-1. MotherDuck preloads a set of the most common DuckDB extensions for you, but does not support loading custom extensions or user-defined functions.
+You can pass your [MotherDuck token](https://motherduck.com/docs/key-tasks/authenticating-and-connecting-to-motherduck/authenticating-to-motherduck/) via the `motherduck_token` property in your profile
+(it may also be set in the `settings` dictionary, as a `motherduck_token` query parameter on the `path`, or via the `motherduck_token` environment variable):
 
-As of `dbt-duckdb` 1.9.6, you can also connect to a DuckDB instance running [hosted DuckLake on MotherDuck](https://motherduck.com/blog/ducklake-motherduck/) by creating a DuckLake on MotherDuck and then setting `is_ducklake: true` in your `profiles.yml`.
-
-```sql
--- to use create your own database in MotherDuck first
-CREATE DATABASE my_ducklake
-  (TYPE ducklake, DATA_PATH 's3://...')
+```yaml
+default:
+  outputs:
+    dev:
+      type: duckdb
+      path: "md:my_db"
+      motherduck_token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+  target: dev
 ```
 
-An example profile is shown below under "Attaching Additional Databases". DuckLake must be identified so that safe DDL operations are applied by dbt.
+To connect to [DuckLakes hosted on MotherDuck](https://motherduck.com/docs/concepts/ducklake/) you need to declare them as DuckLakes with `is_ducklake: true` in your `profiles.yml`.
+
+```yml
+default:
+  outputs:
+    dev:
+      type: duckdb
+      path: "md:my_ducklake"
+      is_ducklake: true
+      motherduck_token: "{{ env_var('MOTHERDUCK_TOKEN') }}"
+  target: dev
+```
+
+MotherDuck databases generally work the same way as local DuckDB databases from the perspective of dbt, but
+there are a [few differences to be aware of](https://motherduck.com/docs/architecture-and-capabilities#considerations-and-limitations):
 
 #### DuckDB Extensions, Settings, and Filesystems
 
@@ -206,21 +245,24 @@ default:
             enable_fsst: true
 ```
 
-For DuckLake, use `ducklake:` for local; for MotherDuck-managed DuckLake use `md:` with `is_ducklake: true`.
+For DuckLake, use `ducklake:` for local lakes. For MotherDuck-managed DuckLake use `md:` with `is_ducklake: true`.
+An attachment whose `type` (or `options.type`) is `ducklake` is recognized as a DuckLake database as well.
 
 ```yaml
 attach:
-  - path: "ducklake:my_ducklake.ddb"
-  - path: "md:my_other_ducklake"
+  - path: "ducklake:my_ducklake.ddb" # local
+  - path: "md:my_other_ducklake"     # MotherDuck
     is_ducklake: true
 ```
 
 
 The attached databases may be referred to in your dbt sources and models by either the basename of the database file minus its suffix (e.g., `/tmp/other.duckdb` is the `other` database
 and `s3://yep/even/this/works.duckdb` is the `works` database) or by an alias that you specify (so the `./yet/another.duckdb` database in the above configuration is referred to
-as `yet_another` instead of `another`.) Note that these additional databases do not necessarily have to be DuckDB files: DuckDB's storage and catalog engines are pluggable, and
+as `yet_another` instead of `another`.) The `database` property of the profile may also be set to one of these names to make an attached database the
+default target for your models. Note that these additional databases do not necessarily have to be DuckDB files: DuckDB's storage and catalog engines are pluggable, and
 DuckDB ships with support for reading and writing from attached databases. You can indicate the type of the database you are connecting to via the `type` argument,
-which currently supports `duckdb`, `sqlite` and `postgres`.
+which currently supports `duckdb`, `sqlite` and `postgres`. For an attachment of a type other than `duckdb` (or `ducklake`), the `path` is typically a connection string
+rather than a database file, so such an attachment can only be used as the profile's `database` through an `alias`.
 
 ##### Arbitrary ATTACH Options
 
@@ -446,7 +488,7 @@ to parse the source in a dbt model. The `formatter` configuration option for the
 we should use `newstyle` string formatting (the default), `oldstyle` string formatting, or `template` string
 formatting. You can read up on the strategies the various string formatting techniques use at this
 [Stack Overflow answer](https://stackoverflow.com/questions/13451989/pythons-many-ways-of-string-formatting-are-the-older-ones-going-to-be-depre) and see examples of their use
-in this [dbt-duckdb integration test](https://github.com/jwills/dbt-duckdb/blob/master/tests/functional/adapter/test_sources.py).
+in this [dbt-duckdb integration test](https://github.com/duckdb/dbt-duckdb/blob/main/tests/functional/adapter/test_sources.py).
 
 #### Writing to external files
 
@@ -576,6 +618,8 @@ select
   date_trunc('day', event_time) as event_day
 from {{ ref('upstream_model') }}
 ```
+
+Each `partitioned_by` entry is rendered as written, so quote identifiers in the config when needed, for example `partitioned_by=['"field name"', 'day("event time")']`. DuckDB/DuckLake validates which partition functions and arguments are supported.
 
 DuckLake applies these via `ALTER TABLE ... SET PARTITIONED BY (...)` and `ALTER TABLE ... SET SORTED BY (...)`, and they only affect new data. For first builds and full refreshes, dbt-duckdb creates an empty table, sets partitioning and/or sort order, then inserts data so the initial load is laid out as configured. For incremental runs that only insert/update, no ALTER is issued. See the DuckLake docs for [partitioning](https://ducklake.select/docs/stable/duckdb/advanced_features/partitioning) and [sorted tables](https://ducklake.select/docs/stable/duckdb/advanced_features/sorted_tables).
 
@@ -799,6 +843,86 @@ The value of the `dbt.ref` and `dbt.source` functions inside of a Python model w
 object that can be easily converted into a Pandas/Polars DataFrame or an Arrow table. The return value of the `model` function can be
 any Python object that DuckDB knows how to turn into a table, including a Pandas/Polars `DataFrame`, a DuckDB `Relation`, or an Arrow `Table`,
 `Dataset`, `RecordBatchReader`, or `Scanner`.
+
+#### Running Python models on MotherDuck Flights
+
+By default a Python model runs in the dbt process itself. On MotherDuck you can instead submit it to a
+[Flight](https://motherduck.com/docs/concepts/flights/), which runs the model in a MotherDuck-managed container next to
+your data. Set `submission_method` on the model:
+
+```python
+def model(dbt, session):
+    dbt.config(
+        materialized="table",
+        submission_method="flight",
+        packages=["pandas==2.2.3", "scikit-learn==1.5.0"],
+        instance_type="F32",   # optional: a bigger runner for this model only
+    )
+    ...
+```
+
+`instance_type` picks the runner a model's Flight runs on, named after its memory: `F4` (0.5 vCPU / 4 GB),
+`F16` (2 vCPU / 16 GB) or `F32` (4 vCPU / 32 GB). Omit it to take the plan default, which is `F16` or the plan cap when
+that is smaller; MotherDuck rejects a size above your plan's cap. Set it per model as above, or project-wide under
+`flights:` below — the model config wins, so one memory-hungry model does not push everything else onto a bigger
+runner. Reach for it only when a run fails on memory pressure and reducing peak memory has not helped.
+
+or make it the default for every Python model in the project via your profile:
+
+```yaml
+default:
+  outputs:
+    dev:
+      type: duckdb
+      path: md:my_db
+      flights:
+        enabled_by_default: true    # individual models can still set submission_method: local
+        access_token_name: analytics-token  # defaults to MotherDuck's built-in Flights token
+        max_runtime_sec: 1800       # per-run timeout enforced by MotherDuck
+        instance_type: F16          # runner size: F4, F16 (default) or F32
+        timeout_sec: 3600           # how long dbt waits for the run to finish
+        poll_interval_sec: 2.0
+        log_lines: 0                # lines of a failed run's log to inline in the dbt error
+        requirements:               # added to every model's own `packages`
+          - pandas==2.2.3
+```
+
+dbt keeps one Flight per model and updates it only when the model's code or requirements actually change — so each
+model gets its own run and version history in the MotherDuck UI. A failing run raises with the Flight name, run number
+and exit code, plus a link to that run's logs in MotherDuck. Flight logs include the whole dependency install, so they
+are not dumped into dbt's output; set `log_lines` to inline that many lines of the log as well.
+
+**Flight names come from a macro you can override.** The default is the model's project, database, schema and
+identifier. Flight names are unique per MotherDuck user, so if two dbt targets share a database and schema — or you
+want your own naming scheme — override `duckdb__flight_name` in your project:
+
+```sql
+{% macro duckdb__flight_name(parsed_model) -%}
+  {{ return('acme-' ~ target.name ~ '-' ~ parsed_model.get('alias')) }}
+{%- endmacro %}
+```
+
+Note that Flights belong to the MotherDuck user who created them, and only that user can run one. Two people running
+the same project each get their own Flight, and neither can reuse the other's.
+
+Three things are worth knowing before you turn this on:
+
+* **This is how you run Python models under MotherDuck SaaS mode.** Local execution is blocked there because the model
+  would run with full filesystem access on the dbt host; a Flight has no such access to your machine.
+* **Each model run costs roughly ten seconds of fixed overhead** (container start plus dependency install), so it pays
+  off for models that need the remote compute, not for small ones that were fine locally.
+* **A Flight's writes are not part of dbt's transaction.** The Flight commits from its own MotherDuck session, so unlike
+  a locally executed Python model, its table survives a rollback later in the same dbt run. A model that fails after
+  materializing can leave a populated table behind.
+
+Only databases a Flight can reach are eligible: your connection has to target a MotherDuck database, and models in a
+local catalog (or in a MotherDuck attachment given a different local alias) are rejected before a run is started, since
+the Flight's own `md:` connection cannot resolve those names.
+
+Because the model body runs on MotherDuck rather than on your machine, anything host-local is unavailable to it: local
+files, modules from `module_paths`, secrets/filesystems/extensions configured on your local connection, non-MotherDuck
+attached databases, and plugin sources materialized as views over in-memory DataFrames. Dependencies must be declared up
+front through `packages` (or `flights.requirements`), since a Flight installs them before the model runs.
 
 #### Batch processing with Python models
 

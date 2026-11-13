@@ -8,10 +8,12 @@ from dbt.tests.adapter.utils.test_bool_or import BaseBoolOr
 from dbt.tests.adapter.utils.test_cast_bool_to_text import BaseCastBoolToText
 from dbt.tests.adapter.utils.test_concat import BaseConcat
 from dbt.tests.adapter.utils.test_current_timestamp import BaseCurrentTimestampNaive
+from dbt.tests.adapter.utils.test_date import BaseDate
 from dbt.tests.adapter.utils.test_date_trunc import BaseDateTrunc
 from dbt.tests.adapter.utils.test_dateadd import BaseDateAdd
 from dbt.tests.adapter.utils.test_datediff import BaseDateDiff
 from dbt.tests.adapter.utils.test_date_spine import BaseDateSpine
+from dbt.tests.adapter.utils.test_equals import BaseEquals
 from dbt.tests.adapter.utils.test_escape_single_quotes import (
     BaseEscapeSingleQuotesQuote,
 )
@@ -48,6 +50,10 @@ class TestConcat(BaseConcat):
     pass
 
 
+class TestDate(BaseDate):
+    pass
+
+
 class TestDateAdd(BaseDateAdd):
     pass
 
@@ -63,6 +69,10 @@ class TestDateSpine(BaseDateSpine):
     pass
 
 class TestDateTrunc(BaseDateTrunc):
+    pass
+
+
+class TestEquals(BaseEquals):
     pass
 
 

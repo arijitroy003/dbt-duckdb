@@ -109,6 +109,13 @@ class TestBasePythonIncremental(BasePythonIncrementalTests):
             )[0]
             == 7
         )
+        # the staging table of each incremental run must not be left behind
+        leftover_tables = project.run_sql(
+            "select table_name from duckdb_tables() "
+            f"where starts_with(table_name, '{model_to_test}__dbt_tmp')",
+            fetch="all",
+        )
+        assert leftover_tables == []
 
 
 empty_upstream_model_python = """
@@ -135,10 +142,13 @@ class TestEmptyPythonModel:
 
     def test_run(self, project):
         run_dbt(["run"])
+        # Scope to this test's schema: on MotherDuck, system.information_schema spans
+        # every database, including ones that concurrent CI jobs are writing to
         result = project.run_sql(
-            """
+            f"""
             select column_name, data_type from system.information_schema.columns
-            where table_name='upstream_model' order by column_name
+            where table_schema='{project.test_schema}' and table_name='upstream_model'
+            order by column_name
             """,
             fetch="all",
         )
